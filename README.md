@@ -35,7 +35,7 @@
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/binhsonvu777-creator/ChromaRevive-AI.git
+    git clone https://github.com/kubryn/ChromaRevive-AI.git
     cd ChromaRevive-AI
     ```
 
