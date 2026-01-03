@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, models
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import numpy as np
 from skimage.color import rgb2lab
 from tqdm import tqdm
@@ -16,7 +16,7 @@ TRAIN_FOLDER = "train_images"
 MODEL_SAVE_NAME = "fast_color_model.pth"
 IMAGE_SIZE = 224      
 BATCH_SIZE = 16       
-EPOCHS = 30            # Increased to 30 for better convergence (takes a bit longer)
+EPOCHS = 30            
 LEARNING_RATE = 0.0002 
 
 # ==========================================
@@ -53,7 +53,6 @@ class ColorWeightedLoss(nn.Module):
 
     def forward(self, pred, target):
         loss = self.base_loss(pred, target)
-        # Weight pixels that are actually colorful higher than gray ones
         color_weight = 1.0 + torch.mean(torch.abs(target), dim=1, keepdim=True) * 2.0
         weighted_loss = loss * color_weight
         return torch.mean(weighted_loss)
@@ -64,23 +63,19 @@ class ColorWeightedLoss(nn.Module):
 class FastColorizer(nn.Module):
     def __init__(self):
         super(FastColorizer, self).__init__()
-        # Load backbone
         resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
         
-        # Modify input for Grayscale
         original_first_layer = resnet.conv1
         self.encoder_first = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         with torch.no_grad():
             self.encoder_first.weight.copy_(original_first_layer.weight.mean(dim=1, keepdim=True))
         
-        # Encoder
         self.enc1 = nn.Sequential(self.encoder_first, resnet.bn1, resnet.relu, resnet.maxpool)
         self.enc2 = resnet.layer1
         self.enc3 = resnet.layer2
         self.enc4 = resnet.layer3
         self.enc5 = resnet.layer4
         
-        # Decoder
         self.dec4 = self._make_dec_block(512 + 256, 256)
         self.dec3 = self._make_dec_block(256 + 128, 128)
         self.dec2 = self._make_dec_block(128 + 64, 64)
@@ -121,23 +116,23 @@ class FastColorizer(nn.Module):
         return self.final(out)
 
 # ==========================================
-# 3. DATASET
+# 3. UNIVERSAL DATASET (ANY IMAGE FORMAT)
 # ==========================================
 class ColorDataset(Dataset):
     def __init__(self, root_dir):
-        self.files = [f for f in os.listdir(root_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
         self.root_dir = root_dir
         
-        # IMPROVED AUGMENTATION
-        # RandomResizedCrop helps the AI learn to color objects at different distances
+        # Support literally any common image extension
+        self.valid_exts = ('.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', 
+                           '.webp', '.gif', '.ppm', '.pgm')
+        
+        self.files = [f for f in os.listdir(root_dir) if f.lower().endswith(self.valid_exts)]
+        
         self.transform = transforms.Compose([
             transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.8, 1.0)), 
             transforms.RandomHorizontalFlip(p=0.5),
             transforms.RandomRotation(degrees=15), 
         ])
-        
-        # Validation transform (Just resize) for when we load the image
-        self.resize_only = transforms.Resize((IMAGE_SIZE, IMAGE_SIZE))
 
     def __len__(self):
         return len(self.files)
@@ -145,9 +140,11 @@ class ColorDataset(Dataset):
     def __getitem__(self, idx):
         try:
             path = os.path.join(self.root_dir, self.files[idx])
+            
+            # .convert("RGB") is crucial!
+            # It handles PNG transparency, GIF palettes, and Greyscale inputs automatically.
             img = Image.open(path).convert("RGB")
             
-            # Apply transforms
             img = self.transform(img)
             img_np = np.array(img)
             
@@ -157,8 +154,11 @@ class ColorDataset(Dataset):
             
             img_t = torch.from_numpy(img_lab.transpose((2, 0, 1)))
             return img_t[[0], ...], img_t[1:, ...]
-        except Exception as e:
-            print(f"Error loading image {idx}: {e}")
+            
+        except (UnidentifiedImageError, OSError, Exception) as e:
+            # If an image is corrupt, don't crash. Return a blank black image.
+            # This allows training to continue even if one file is bad.
+            # print(f"Skipping corrupt file: {self.files[idx]}")
             return torch.zeros(1, IMAGE_SIZE, IMAGE_SIZE), torch.zeros(2, IMAGE_SIZE, IMAGE_SIZE)
 
 # ==========================================
@@ -174,9 +174,9 @@ def train():
     dataset = ColorDataset(TRAIN_FOLDER)
     if len(dataset) == 0:
         print(f"ERROR: No images found in {TRAIN_FOLDER}")
+        print(f"Supported formats: JPG, PNG, WEBP, BMP, TIFF, GIF, etc.")
         return
 
-    # On CPU, pin_memory doesn't help. On GPU it does.
     use_pin = (DEVICE == 'cuda')
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, pin_memory=use_pin)
     
@@ -185,13 +185,8 @@ def train():
     
     criterion = ColorWeightedLoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
-    
-    # LEARNING RATE SCHEDULER
-    # Every 10 epochs, we cut the learning rate in half.
-    # This helps the model settle into a more accurate solution.
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5)
     
-    # Mixed Precision Scaler (Only for GPU)
     scaler = torch.amp.GradScaler('cuda') if DEVICE == 'cuda' else None
 
     print(f"Starting training on {len(dataset)} images for {EPOCHS} epochs.")
@@ -208,7 +203,6 @@ def train():
             
             optimizer.zero_grad()
             
-            # Mixed Precision for GPU (Faster)
             if DEVICE == 'cuda':
                 with torch.amp.autocast('cuda'):
                     pred_ab = model(L)
@@ -218,7 +212,6 @@ def train():
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                # Standard Precision for CPU
                 pred_ab = model(L)
                 loss = criterion(pred_ab, ab)
                 loss.backward()
@@ -228,15 +221,12 @@ def train():
             loop.set_description(f"Epoch [{epoch+1}/{EPOCHS}]")
             loop.set_postfix(loss=loss.item())
 
-        # Update Learning Rate
         scheduler.step()
         
-        # Save Best Model Logic
         avg_loss = running_loss / len(loader)
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(), MODEL_SAVE_NAME)
-            # We don't print every time to keep it clean, but tqdm shows the loss dropping
 
     print("\n-------------------------------------------")
     print(f"Training Complete!")

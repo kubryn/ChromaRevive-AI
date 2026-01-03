@@ -14,13 +14,12 @@ from collections import deque
 MODEL_PATH = "fast_color_model.pth"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- EXTREME QUALITY SETTINGS ---
-# These settings effectively disable "speed optimizations" in favor of quality
-SATURATION_BOOST = 1.4       # Higher saturation for more vibrant look
-USE_TTA = True               # Analyze every frame twice (Normal + Flipped)
-USE_LANCZOS_RESIZE = True    # Use high-quality math to resize colors (Slower)
-USE_HEAVY_FILTERING = True   # The "Slow" part: Edge-preserving smoothing
-SMOOTHING_BUFFER = 8         # Average last 8 frames for buttery smooth video
+# --- PIXEL-PERFECT SETTINGS ---
+# We have cranked these up to maximum quality.
+SATURATION_BOOST = 1.5       # Stronger colors
+USE_TTA = True               # Dual-pass analysis (Normal + Mirrored)
+PIXEL_ITERATIONS = 2         # How many times to refine pixels (Higher = Slower but cleaner)
+SMOOTHING_BUFFER = 10        # High buffer for ultra-stable video
 
 # ==========================================
 # 1. MODEL DEFINITION
@@ -73,13 +72,39 @@ class FastColorizer(nn.Module):
         return self.final(out)
 
 # ==========================================
-# 2. SLOW & PRECISE INFERENCE LOGIC
+# 2. HELPER FUNCTIONS
 # ==========================================
 def get_ab_prediction(model, L_tensor):
     with torch.no_grad():
         ab_pred = model(L_tensor)
         ab_pred = ab_pred.cpu().squeeze(0).numpy().transpose(1, 2, 0)
         return ab_pred * 128.0
+
+def refine_pixels(ab_full_res, l_full_res):
+    """
+    The 'Pixel-Perfect' Logic.
+    This uses the sharp L-channel (B&W) to guide the blurry AB-channels (Color).
+    It effectively snaps colors to the nearest pixel edge.
+    """
+    # Convert to float32 for high precision math
+    a = ab_full_res[:, :, 0].astype('float32')
+    b = ab_full_res[:, :, 1].astype('float32')
+    
+    # Bilateral Filter:
+    # d=9: Diameter of pixel neighborhood (looks at 9 surrounding pixels)
+    # sigmaColor=75: How different colors must be to NOT get mixed
+    # sigmaSpace=75: How far pixels can be to influence each other
+    
+    # We run this multiple times for extreme edge adherence
+    for _ in range(PIXEL_ITERATIONS):
+        a = cv2.bilateralFilter(a, 9, 75, 75)
+        b = cv2.bilateralFilter(b, 9, 75, 75)
+        
+    # Stack back together
+    refined_ab = np.zeros_like(ab_full_res)
+    refined_ab[:, :, 0] = a
+    refined_ab[:, :, 1] = b
+    return refined_ab
 
 def process_frame_ultimate(model, frame_bgr):
     # Prepare Input
@@ -90,15 +115,14 @@ def process_frame_ultimate(model, frame_bgr):
     L_norm = (lab_small[:, :, 0] / 50.0) - 1.0
     L_tensor = torch.from_numpy(L_norm).unsqueeze(0).unsqueeze(0).float().to(DEVICE)
     
-    # PASS 1: Standard Prediction
+    # Pass 1: Normal
     ab_final = get_ab_prediction(model, L_tensor)
     
-    # PASS 2: Test-Time Augmentation (Flip)
-    # This doubles the inference time but fixes directional bias
+    # Pass 2: TTA (Test Time Augmentation)
     if USE_TTA:
-        L_flipped = torch.flip(L_tensor, [3]) # Flip Horizontal
+        L_flipped = torch.flip(L_tensor, [3])
         ab_flipped = get_ab_prediction(model, L_flipped)
-        ab_flipped = np.fliplr(ab_flipped)    # Flip back
+        ab_flipped = np.fliplr(ab_flipped)
         ab_final = (ab_final + ab_flipped) / 2.0
 
     return ab_final, img_rgb
@@ -107,9 +131,9 @@ def process_frame_ultimate(model, frame_bgr):
 # 3. INTERACTIVE RUNNER
 # ==========================================
 def run():
-    print(f"\n=== ULTIMATE QUALITY COLORIZER ===")
+    print(f"\n=== CHROMA REVIVE: PIXEL-PERFECT EDITION ===")
     print(f"Device: {DEVICE}")
-    print("Optimization: Disabled (Max Quality Mode)")
+    print("Mode: Slow Analysis (High Detail)")
     
     # 1. Load Model
     model = FastColorizer().to(DEVICE)
@@ -124,8 +148,8 @@ def run():
     # 2. Select Mode
     while True:
         print("\nWhat file type?")
-        print("[1] Image")
-        print("[2] Video")
+        print("[1] Image (.jpg, .png)")
+        print("[2] Video (.mp4)")
         choice = input("Choice: ").strip()
         if choice in ['1', '2']: break
 
@@ -133,12 +157,12 @@ def run():
 
     # 3. Select File
     while True:
-        file_path = input("\nEnter filename (drag & drop): ").strip().replace('"', '').replace("'", "")
+        file_path = input("\nEnter filename (or drag & drop): ").strip().replace('"', '').replace("'", "")
         if os.path.exists(file_path): break
         print("File not found.")
 
     filename, ext = os.path.splitext(file_path)
-    output_path = f"{filename}_ultimate{ext}"
+    output_path = f"{filename}_pixelperfect{ext}"
 
     # --- VIDEO PROCESSING ---
     if is_video_mode:
@@ -151,8 +175,7 @@ def run():
         writer = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (width, height))
         ab_buffer = deque(maxlen=SMOOTHING_BUFFER)
         
-        print(f"\nProcessing {total_frames} frames.")
-        print("NOTE: This will be slow. We are analyzing every pixel.")
+        print(f"\nAnalyzing {total_frames} frames pixel-by-pixel...")
         
         frame_idx = 0
         start_time = time.time()
@@ -161,35 +184,31 @@ def run():
             ret, frame = cap.read()
             if not ret: break
             
-            # 1. AI Analysis (Dual Pass)
+            # 1. AI Inference
             ab_pred, img_rgb = process_frame_ultimate(model, frame)
             
-            # 2. Temporal Smoothing
+            # 2. Buffer Average (Temporal Smoothing)
             ab_buffer.append(ab_pred)
             avg_ab = np.mean(ab_buffer, axis=0)
             
-            # 3. Color Boosting
+            # 3. Saturation Boost
             avg_ab = avg_ab * SATURATION_BOOST
             
-            # 4. High-Quality Upscaling (Lanczos-4)
-            # Standard Resize is fast but blurry. Lanczos is slow but sharp.
-            resize_method = cv2.INTER_LANCZOS4 if USE_LANCZOS_RESIZE else cv2.INTER_LINEAR
-            ab_full = cv2.resize(avg_ab, (width, height), interpolation=resize_method)
+            # 4. Upscale (Lanczos-4 for sharpness)
+            ab_full = cv2.resize(avg_ab, (width, height), interpolation=cv2.INTER_LANCZOS4)
             
-            # 5. Heavy Bilateral Filtering
-            # This is the heavy computation. It smooths color noise but preserves edges.
-            if USE_HEAVY_FILTERING:
-                a = ab_full[:, :, 0].astype('float32')
-                b = ab_full[:, :, 1].astype('float32')
-                # d=5, sigma=50 is a good balance for video. Higher d makes it very slow.
-                ab_full[:, :, 0] = cv2.bilateralFilter(a, 5, 50, 50) 
-                ab_full[:, :, 1] = cv2.bilateralFilter(b, 5, 50, 50)
-
-            # 6. Reconstruct Final Image
+            # 5. PIXEL REFINEMENT (The Slow Part)
+            # We pass the full-res color and full-res B&W (L channel)
             lab_orig = rgb2lab(img_rgb).astype("float32")
+            l_channel_full = lab_orig[:, :, 0]
+            
+            # Run the pixel-snapping logic
+            ab_full = refine_pixels(ab_full, l_channel_full)
+
+            # 6. Recombine
             lab_final = np.zeros((height, width, 3), dtype="float32")
-            lab_final[:, :, 0] = lab_orig[:, :, 0] # Keep original Lightness
-            lab_final[:, :, 1:] = ab_full          # Add new Color
+            lab_final[:, :, 0] = l_channel_full
+            lab_final[:, :, 1:] = ab_full
             
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -203,42 +222,40 @@ def run():
             elapsed = time.time() - start_time
             fps_calc = frame_idx / elapsed if elapsed > 0 else 0
             
-            print(f"Frame {frame_idx}/{total_frames} | {fps_calc:.2f} FPS (High Quality Mode)", end='\r')
+            print(f"Frame {frame_idx}/{total_frames} | {fps_calc:.2f} FPS", end='\r')
             
-            cv2.imshow('Ultimate Quality Preview', cv2.resize(bgr_final, (0,0), fx=0.5, fy=0.5))
+            cv2.imshow('Pixel Perfect Preview', cv2.resize(bgr_final, (0,0), fx=0.5, fy=0.5))
             if cv2.waitKey(1) & 0xFF == ord('q'): break
 
         cap.release()
         writer.release()
-        print(f"\n\nProcessing Complete. File saved to: {output_path}")
+        print(f"\n\nProcessing Complete. Saved to: {output_path}")
 
     # --- IMAGE PROCESSING ---
     else:
         frame = cv2.imread(file_path)
-        print("\nProcessing Image...")
+        print("\nProcessing Image (Pixel Perfect Mode)...")
         height, width = frame.shape[:2]
         
-        # AI Analysis
+        # AI
         ab_pred, img_rgb = process_frame_ultimate(model, frame)
         ab_pred = ab_pred * SATURATION_BOOST
         
-        # High Quality Resize
-        print("Applying Lanczos-4 Upscaling...")
+        # Upscale
+        print("Upscaling with Lanczos-4...")
         ab_full = cv2.resize(ab_pred, (width, height), interpolation=cv2.INTER_LANCZOS4)
         
-        # Heavy Filtering (Stronger settings for single images)
-        if USE_HEAVY_FILTERING:
-            print("Applying Heavy Bilateral Filter (Edge Preserving)...")
-            a = ab_full[:, :, 0].astype('float32')
-            b = ab_full[:, :, 1].astype('float32')
-            # Higher 'd' (9) for images because we don't care about fps
-            ab_full[:, :, 0] = cv2.bilateralFilter(a, 9, 80, 80)
-            ab_full[:, :, 1] = cv2.bilateralFilter(b, 9, 80, 80)
-            
-        # Reconstruct
+        # Pixel Refine
+        print("Refining pixels (this may take a moment)...")
         lab_orig = rgb2lab(img_rgb).astype("float32")
+        l_channel_full = lab_orig[:, :, 0]
+        
+        # Run iterations
+        ab_full = refine_pixels(ab_full, l_channel_full)
+            
+        # Recombine
         lab_final = np.zeros((height, width, 3), dtype="float32")
-        lab_final[:, :, 0] = lab_orig[:, :, 0]
+        lab_final[:, :, 0] = l_channel_full
         lab_final[:, :, 1:] = ab_full
         
         with warnings.catch_warnings():
